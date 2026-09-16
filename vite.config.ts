@@ -7,6 +7,18 @@ export default defineConfig({
   tanstackStart: {
     server: { entry: "server" },
   },
+  // Deploy target: build a Vercel SSR bundle instead of the Lovable/Cloudflare
+  // default. The Lovable config forces output into dist/server + dist/client,
+  // which breaks Vercel; restore Nitro's native vercel-preset output layout
+  // (.vercel/output Build Output API) so Vercel serves the app instead of 404ing.
+  nitro: {
+    preset: "vercel",
+    output: {
+      dir: "{{ rootDir }}/.vercel/output",
+      serverDir: "{{ output.dir }}/functions/__server.func",
+      publicDir: "{{ output.dir }}/static/{{ baseURL }}",
+    },
+  },
   vite: {
     server: {
       proxy: {

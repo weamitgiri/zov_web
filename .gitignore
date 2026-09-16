@@ -7,6 +7,9 @@ node_modules/
 dist/
 dist-ssr/
 build/
+.output/
+.vercel/
+.nitro/
 *.local
 
 # Environment / secrets
