@@ -1,0 +1,1960 @@
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
+import { useState, useEffect, useRef, type FormEvent, type ChangeEvent, type ComponentType, type Dispatch, type SetStateAction, type ReactNode } from "react";
+import { Header } from "@/components/Header";
+import { Crumbs } from "@/components/Crumbs";
+import { Footer } from "@/components/Footer";
+import { PillButton } from "@/components/PillButton";
+import { Button } from "@/components/ui/button";
+import { Calendar as CalendarPicker } from "@/components/ui/calendar";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { toastSuccess, toastWarning, toastError } from "@/lib/toast";
+import { organizerService } from "@/api/services/organizer.service";
+import { mapApiFieldErrors, parseApiError } from "@/api/errors";
+import {
+  normalizeWebsite,
+  validateOtpCode,
+  validateRegistrationForm,
+  type RegistrationFieldErrors,
+} from "@/utils/organizer";
+import {
+  buildJoinUrl,
+  calculateBillingTotals,
+  formatDisplayDate,
+  formatDisplayTime,
+  formatPrice,
+  formatDateInputValue,
+  getSelectableScheduleDateBounds,
+  normalizeScheduledTime,
+  perUserLabel,
+  validateBillingForm,
+  validateSessionSetup,
+  type BillingFieldErrors,
+  type SetupFieldErrors,
+} from "@/utils/booking";
+import type {
+  BookingConsents,
+  PaymentMethodId,
+  PaymentMethodOption,
+  RegistrationFormData,
+  SessionSetup,
+} from "@/api/types/organizer";
+import type { ApiActivity, ApiPackage } from "@/api/types/public";
+import { useGames, useGameDetails, usePackages, usePaymentMethods } from "@/hooks/usePublicContent";
+import { loadRazorpayCheckout, openRazorpayCheckout } from "@/utils/razorpay";
+import { resolveMediaUrl } from "@/utils/media";
+import { isOrganizerAuthenticated } from "@/lib/auth";
+import { Check, Mail, User, Copy, MessageCircle, Share2, CheckCircle2, X, Loader2, Calendar as CalendarIcon, Link2, Clock, Package as PackageIcon, Gamepad2, LockKeyhole, ArrowRight } from "lucide-react";
+import mystery from "@/assets/login-a.jpg";
+import cook from "@/assets/login-c.jpg";
+import hero from "@/assets/hero.jpg";
+
+const FALLBACK_IMAGES = [mystery, cook];
+
+const INDIAN_STATES = [
+  { value: "Andhra Pradesh", label: "Andhra Pradesh" },
+  { value: "Arunachal Pradesh", label: "Arunachal Pradesh" },
+  { value: "Assam", label: "Assam" },
+  { value: "Bihar", label: "Bihar" },
+  { value: "Chhattisgarh", label: "Chhattisgarh" },
+  { value: "Goa", label: "Goa" },
+  { value: "Gujarat", label: "Gujarat" },
+  { value: "Haryana", label: "Haryana" },
+  { value: "Himachal Pradesh", label: "Himachal Pradesh" },
+  { value: "Jharkhand", label: "Jharkhand" },
+  { value: "Karnataka", label: "Karnataka" },
+  { value: "Kerala", label: "Kerala" },
+  { value: "Madhya Pradesh", label: "Madhya Pradesh" },
+  { value: "Maharashtra", label: "Maharashtra" },
+  { value: "Manipur", label: "Manipur" },
+  { value: "Meghalaya", label: "Meghalaya" },
+  { value: "Mizoram", label: "Mizoram" },
+  { value: "Nagaland", label: "Nagaland" },
+  { value: "Odisha", label: "Odisha" },
+  { value: "Punjab", label: "Punjab" },
+  { value: "Rajasthan", label: "Rajasthan" },
+  { value: "Sikkim", label: "Sikkim" },
+  { value: "Tamil Nadu", label: "Tamil Nadu" },
+  { value: "Telangana", label: "Telangana" },
+  { value: "Tripura", label: "Tripura" },
+  { value: "Uttar Pradesh", label: "Uttar Pradesh" },
+  { value: "Uttarakhand", label: "Uttarakhand" },
+  { value: "West Bengal", label: "West Bengal" },
+  { value: "Andaman and Nicobar Islands", label: "Andaman and Nicobar Islands" },
+  { value: "Chandigarh", label: "Chandigarh" },
+  { value: "Dadra and Nagar Haveli and Daman and Diu", label: "Dadra and Nagar Haveli and Daman and Diu" },
+  { value: "Delhi", label: "Delhi" },
+  { value: "Jammu and Kashmir", label: "Jammu and Kashmir" },
+  { value: "Ladakh", label: "Ladakh" },
+  { value: "Lakshadweep", label: "Lakshadweep" },
+  { value: "Puducherry", label: "Puducherry" },
+];
+
+/**
+ * Create route for organizer registration, session setup, and payment activation.
+ * Includes step-by-step form progression with proper loading states and toast messaging.
+ */
+export const Route = createFileRoute("/create")({
+  validateSearch: (search: Record<string, unknown>) => ({
+    activity: typeof search.activity === "string" ? search.activity : undefined,
+  }),
+  head: () => ({
+    meta: [
+      { title: "Create Your Session — Zoventro" },
+      { name: "description", content: "Set up your account, choose a package, and start your team engagement experience in minutes." },
+      { property: "og:title", content: "Create Your Session — Zoventro" },
+    ],
+  }),
+  component: CreatePage,
+});
+
+const STEPS = ["Details", "Verify", "Setup", "Payment"];
+
+const emptyRegistration = (): RegistrationFormData => ({
+  name: "",
+  email: "",
+  company_name: "",
+  company_website: "",
+  organizer_id: null,
+});
+
+const emptySessionSetup = (): SessionSetup => ({
+  activityId: null,
+  activityTitle: "",
+  gameId: null,
+  gameTitle: "",
+  package: null,
+  scheduledDate: "",
+  scheduledTime: "",
+});
+
+function CreatePage() {
+  const { activity: activitySlug } = Route.useSearch();
+  const authenticated = isOrganizerAuthenticated();
+  const [step, setStep] = useState(() => (authenticated ? 2 : 0));
+  // Highest step reached — keeps Setup/Payment navigable both ways after going
+  // back, while Details/Verify (one-time steps) stay locked.
+  const [maxStep, setMaxStep] = useState(() => (authenticated ? 2 : 0));
+  const [done, setDone] = useState(false);
+  const [bookingId, setBookingId] = useState<number | null>(null);
+  const [invitationLink, setInvitationLink] = useState<string | null>(null);
+  const [session, setSession] = useState<SessionSetup>(emptySessionSetup);
+  const [registration, setRegistration] = useState<RegistrationFormData>(emptyRegistration);
+  const [activeSlide, setActiveSlide] = useState(0);
+  const [isAuthLoading, setIsAuthLoading] = useState(false);
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    if (!authenticated) return;
+
+    setIsAuthLoading(true);
+    organizerService
+      .getDashboard()
+      .then((result) => {
+        if (result.organizer) {
+          setRegistration((prev) => ({
+            ...prev,
+            organizer_id: result.organizer.id,
+            name: result.organizer.name ?? prev.name,
+            email: result.organizer.email ?? prev.email,
+            company_name: result.organizer.company_name ?? prev.company_name,
+          }));
+          setStep(2);
+        }
+      })
+      .catch(() => {
+        // If token is invalid or dashboard fetch fails, continue with the normal flow.
+      })
+      .finally(() => {
+        setIsAuthLoading(false);
+      });
+  }, [authenticated]);
+
+  const SLIDES = [
+    { url: hero, alt: "Team Collaborating" },
+    { url: mystery, alt: "Mystery Quest Challenge" },
+    { url: cook, alt: "Cook & Create Event" }
+  ];
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setActiveSlide((prev) => (prev + 1) % SLIDES.length);
+    }, 4000);
+    return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    setMaxStep((m) => Math.max(m, step));
+  }, [step]);
+
+  return (
+    <div className="min-h-screen pb-10">
+      <div className="pt-6"><Header /></div>
+      {/* <div className="mx-auto max-w-6xl px-4 mt-4">
+        <Crumbs items={[{ label: "Home", to: "/" }, { label: "Create Session" }]} />
+      </div> */}
+
+      <section className="px-4 mt-12">
+        {done ? (
+          <SuccessCard
+            invitationLink={invitationLink}
+            session={session}
+            bookingId={bookingId}
+            onReset={() => {
+              setDone(false);
+              setStep(authenticated ? 2 : 0);
+              setMaxStep(authenticated ? 2 : 0);
+              setBookingId(null);
+              setInvitationLink(null);
+              setSession(emptySessionSetup());
+              if (!authenticated) {
+                setRegistration(emptyRegistration());
+              }
+            }}
+          />
+        ) : (
+          <div className="mx-auto max-w-6xl mt-12 grid lg:grid-cols-2 gap-8 items-start">
+            <div className="rounded-3xl overflow-hidden shadow-elevated min-h-[520px] bg-gradient-soft relative w-full">
+              {SLIDES.map((slide, index) => (
+                <img
+                  key={slide.url}
+                  src={slide.url}
+                  alt={slide.alt}
+                  className={`absolute inset-0 h-full w-full object-cover min-h-[520px] transition-opacity duration-1000 ${
+                    index === activeSlide ? "opacity-100" : "opacity-0"
+                  }`}
+                />
+              ))}
+              {/* Carousel dots */}
+              <div className="absolute bottom-6 left-0 right-0 flex justify-center gap-2.5 z-10">
+                {SLIDES.map((_, index) => (
+                  <button
+                    key={index}
+                    type="button"
+                    onClick={() => setActiveSlide(index)}
+                    className={`h-2.5 w-2.5 rounded-full transition-all duration-300 cursor-pointer ${
+                      index === activeSlide 
+                        ? "bg-primary scale-110 shadow-sm" 
+                        : "bg-gray-300 hover:bg-gray-400"
+                    }`}
+                    aria-label={`Go to slide ${index + 1}`}
+                  />
+                ))}
+              </div>
+            </div>
+
+            <div className="rounded-3xl bg-card shadow-elevated p-8 md:p-10">
+              <Stepper step={step} onStepClick={setStep} maxStep={maxStep} />
+              {authenticated && isAuthLoading && (
+                <div className="rounded-2xl border border-border bg-muted/50 p-4 mt-6 text-sm text-muted-foreground">
+                  Loading your organizer profile so you can continue with another game selection...
+                </div>
+              )}
+              <div className="mt-8">
+                {step === 0 && (
+                  <DetailsStep
+                    registration={registration}
+                    setRegistration={setRegistration}
+                    onNext={() => setStep(1)}
+                  />
+                )}
+                {step === 1 && (
+                  <VerifyStep
+                    email={registration.email}
+                    onBack={() => setStep(0)}
+                    onVerified={(organizerId) => {
+                      setRegistration((prev) => ({ ...prev, organizer_id: organizerId }));
+                      setStep(2);
+                    }}
+                  />
+                )}
+                {step === 2 && (
+                  <SetupStep
+                    organizerId={registration.organizer_id}
+                    initialActivitySlug={activitySlug}
+                    session={session}
+                    setSession={setSession}
+                    onNext={(id) => {
+                      setBookingId(id);
+                      setStep(3);
+                    }}
+                  />
+                )}
+                {step === 3 && (
+                  <PaymentStep
+                    bookingId={bookingId}
+                    session={session}
+                    registration={registration}
+                    onComplete={(link) => {
+                      setInvitationLink(link);
+                      // A returning organizer who logged in unpaid and completed
+                      // payment here is already authenticated — send her straight
+                      // to the dashboard. A brand-new registrant has no session
+                      // token yet, so show the success card with the login link.
+                      if (authenticated) {
+                        toastSuccess("Payment successful. Your package is now active.");
+                        navigate({ to: "/dashboard" });
+                      } else {
+                        setDone(true);
+                      }
+                    }}
+                  />
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+      </section>
+
+      <Footer />
+    </div>
+  );
+}
+
+function Stepper({
+  step,
+  onStepClick,
+  maxStep,
+}: {
+  step: number;
+  onStepClick?: (i: number) => void;
+  maxStep?: number;
+}) {
+  const reached = maxStep ?? step;
+  return (
+    <div className="relative mb-10 mt-2 px-2 md:px-6">
+      {/* Connecting lines track */}
+      <div className="absolute top-5 left-[12%] right-[12%] h-[2px] bg-border" />
+      {/* Active progress line */}
+      <div
+        className="absolute top-5 left-[12%] h-[2px] bg-[#8B5CF6] transition-all duration-500"
+        style={{ width: `${(step / (STEPS.length - 1)) * 76}%` }}
+      />
+
+      <div className="relative z-10 flex items-start justify-between">
+        {STEPS.map((label, i) => {
+          const active = i === step;
+          const complete = i < step;
+          // Only Setup & Payment (index >= 2) are navigable — Details (0) and
+          // Verify (1) are one-time steps and stay locked. A step is clickable
+          // once it's been reached and isn't the current one (so you can move
+          // back and forth between Setup and Payment).
+          const clickable = i >= 2 && i <= reached && i !== step && !!onStepClick;
+          return (
+            <button
+              key={label}
+              type="button"
+              disabled={!clickable}
+              onClick={clickable ? () => onStepClick?.(i) : undefined}
+              aria-label={clickable ? `Go back to ${label}` : label}
+              className={`group flex flex-col items-center gap-2.5 bg-card px-2 ${clickable ? "cursor-pointer" : "cursor-default"}`}
+            >
+              <div className={`grid h-10 w-10 place-items-center rounded-full text-sm font-medium transition-colors border ${
+                complete || active
+                  ? "border-[#8B5CF6] bg-purple-100 text-[#8B5CF6]"
+                  : "border-gray-300 bg-white text-muted-foreground"
+              } ${clickable ? "group-hover:bg-purple-200" : ""}`}>
+                {complete ? <Check className="h-5 w-5 text-[#8B5CF6]" strokeWidth={2.5} /> : String(i + 1).padStart(2, "0")}
+              </div>
+              <span className={`text-[12px] font-medium ${complete || active ? "text-[#8B5CF6]" : "text-muted-foreground"} ${clickable ? "group-hover:underline" : ""}`}>{label}</span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function Field({
+  label,
+  icon: Icon,
+  type = "text",
+  placeholder,
+  value,
+  onChange,
+  error,
+}: {
+  label: ReactNode;
+  icon?: ComponentType<{ className?: string }>;
+  type?: string;
+  placeholder?: string;
+  value?: string;
+  onChange?: (event: ChangeEvent<HTMLInputElement>) => void;
+  error?: string;
+}) {
+  return (
+    <div>
+      <label className="text-sm font-medium flex items-center">{label}</label>
+      <div className="mt-2 relative">
+        <input
+          value={value}
+          onChange={onChange}
+          type={type}
+          placeholder={placeholder}
+          aria-invalid={!!error}
+          className={`w-full rounded-lg border px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary/30 ${
+            error ? "border-destructive" : "border-input"
+          }`}
+        />
+        {Icon && (
+          <Icon className="h-4 w-4 absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+        )}
+      </div>
+      {error && <p className="mt-1 text-xs text-destructive">{error}</p>}
+    </div>
+  );
+}
+
+function DetailsStep({
+  registration,
+  setRegistration,
+  onNext,
+}: {
+  registration: RegistrationFormData;
+  setRegistration: Dispatch<SetStateAction<RegistrationFormData>>;
+  onNext: () => void;
+}) {
+  const [errors, setErrors] = useState<RegistrationFieldErrors>({});
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const update = (field: keyof RegistrationFormData, value: string) => {
+    setRegistration((prev) => ({ ...prev, [field]: value }));
+    if (errors[field as keyof RegistrationFieldErrors]) {
+      setErrors((prev) => ({ ...prev, [field]: undefined }));
+    }
+  };
+
+  const handleSubmit = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+
+    const clientErrors = validateRegistrationForm(registration);
+    if (Object.keys(clientErrors).length > 0) {
+      setErrors(clientErrors);
+      toastWarning("Please fix the errors below.");
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      const data = await organizerService.register({
+        name: registration.name.trim(),
+        email: registration.email.trim(),
+        company_name: registration.company_name.trim(),
+        company_website: normalizeWebsite(registration.company_website),
+      });
+      setRegistration((prev) => ({
+        ...prev,
+        organizer_id: Number(data.organizer_id),
+      }));
+      toastSuccess("OTP sent to your email. Please verify to continue.");
+      onNext();
+    } catch (err) {
+      const { message, fieldErrors } = parseApiError(err);
+      setErrors(mapApiFieldErrors(fieldErrors) as RegistrationFieldErrors);
+      toastError(message);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <form onSubmit={handleSubmit} className="space-y-4">
+      <h2 className="text-2xl font-bold">Organizer Details</h2>
+      <p className="text-sm text-muted-foreground">
+        Provide basic details to set up your team engagement activity.
+      </p>
+      <Field
+        label={
+          <span className="flex items-center gap-1.5">
+            Full Name <span className="text-muted-foreground font-normal text-xs">(Primary Contact Person)</span>
+          </span>
+        }
+        icon={User}
+        placeholder="Enter your full name"
+        value={registration.name}
+        onChange={(e) => update("name", e.target.value)}
+        error={errors.name}
+      />
+      <Field
+        label={
+          <span className="flex items-center gap-1.5">
+            Official Email ID <span className="text-muted-foreground font-normal text-xs invisible md:visible">An OTP will be sent to this email for verification</span>
+          </span>
+        }
+        icon={Mail}
+        type="email"
+        placeholder="Enter your work email"
+        value={registration.email}
+        onChange={(e) => update("email", e.target.value)}
+        error={errors.email}
+      />
+      <Field
+        label="Company / Organization Name"
+        placeholder="Enter Company Name"
+        value={registration.company_name}
+        onChange={(e) => update("company_name", e.target.value)}
+        error={errors.company_name}
+      />
+      <Field
+        label="Company Website"
+        placeholder="https://yourcompany.com"
+        value={registration.company_website}
+        onChange={(e) => update("company_website", e.target.value)}
+        error={errors.company_website}
+      />
+      <div className="pt-2">
+        <Button
+          type="submit"
+          className="w-full sm:w-auto min-w-[240px] h-12 bg-gradient-blue hover:opacity-90 text-white rounded-full flex items-center justify-between pl-6 pr-1.5 shadow-md border-0"
+          disabled={isSubmitting}
+        >
+          {isSubmitting ? (
+            <span className="flex items-center justify-center w-full">
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Submitting...
+            </span>
+          ) : (
+            <>
+              <span className="font-medium text-[15px]">Submit &amp; Verify Email</span>
+              <span className="grid h-9 w-9 place-items-center rounded-full bg-white text-[#8B5CF6] ml-4">
+                <ArrowRight className="h-4 w-4" strokeWidth={2.5} />
+              </span>
+            </>
+          )}
+        </Button>
+      </div>
+      <p className="text-xs text-muted-foreground pt-2">
+        Already have an account?{" "}
+        <Link to="/login" search={{ redirect: undefined }} className="text-[#8B5CF6] font-semibold">
+          Login
+        </Link>
+      </p>
+    </form>
+  );
+}
+
+function VerifyStep({
+  email,
+  onBack,
+  onVerified,
+}: {
+  email: string;
+  onBack: () => void;
+  onVerified: (organizerId: number) => void;
+}) {
+  const [otp, setOtp] = useState(["", "", "", "", "", ""]);
+  const [otpError, setOtpError] = useState<string | null>(null);
+  const [isVerifying, setIsVerifying] = useState(false);
+  const [isResending, setIsResending] = useState(false);
+  const otpInputs = useRef<Array<HTMLInputElement | null>>([]);
+
+  const otpValue = otp.join("");
+
+  const handleSubmit = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const err = validateOtpCode(otpValue);
+    if (err) {
+      setOtpError(err);
+      toastWarning(err);
+      return;
+    }
+
+    setIsVerifying(true);
+    try {
+      const data = await organizerService.verifyRegistrationOtp({
+        email: email.trim(),
+        otp: otpValue,
+      });
+      toastSuccess("Email verified successfully.");
+      onVerified(Number(data.organizer_id));
+    } catch (err) {
+      const { message } = parseApiError(err);
+      setOtpError(message);
+      toastError(message);
+    } finally {
+      setIsVerifying(false);
+    }
+  };
+
+  const handleResend = async () => {
+    setIsResending(true);
+    try {
+      await organizerService.resendOtp({ email: email.trim() });
+      toastSuccess("A new OTP has been sent to your email.");
+    } catch (err) {
+      toastError(parseApiError(err).message);
+    } finally {
+      setIsResending(false);
+    }
+  };
+
+  return (
+    <form onSubmit={handleSubmit} className="space-y-5">
+      <div>
+        <h2 className="text-2xl font-bold">Verify Your Email</h2>
+        <p className="text-sm text-muted-foreground mt-1">
+          Enter the OTP sent to your email to continue.
+        </p>
+      </div>
+      <p className="text-sm">
+        We have sent a 6 digit code to{" "}
+        <span className="font-semibold text-primary">{email}</span>
+      </p>
+      <div className="flex gap-2.5">
+        {otp.map((d, i) => (
+          <input
+            key={i}
+            ref={(el) => {
+              otpInputs.current[i] = el;
+            }}
+            value={d}
+            onChange={(e) => {
+              const value = e.target.value.replace(/\D/g, "").slice(-1);
+              const next = [...otp];
+              next[i] = value;
+              setOtp(next);
+              if (otpError) setOtpError(null);
+              if (value && i < otpInputs.current.length - 1) {
+                otpInputs.current[i + 1]?.focus();
+              }
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Backspace" && !otp[i] && i > 0) {
+                otpInputs.current[i - 1]?.focus();
+              }
+            }}
+            onPaste={(e) => {
+              const pasted = e.clipboardData.getData("text").replace(/\D/g, "");
+              if (!pasted) return;
+              e.preventDefault();
+              const nextOtp = [...otp];
+              for (let j = 0; j < pasted.length && i + j < nextOtp.length; j += 1) {
+                nextOtp[i + j] = pasted[j];
+              }
+              setOtp(nextOtp);
+              const focusIndex = Math.min(i + pasted.length, otpInputs.current.length - 1);
+              otpInputs.current[focusIndex]?.focus();
+            }}
+            inputMode="numeric"
+            maxLength={1}
+            aria-label={`OTP digit ${i + 1}`}
+            className={`h-14 w-14 rounded-lg border-2 text-center text-xl font-bold text-primary focus:border-primary focus:outline-none ${
+              otpError ? "border-destructive" : "border-input"
+            }`}
+          />
+        ))}
+      </div>
+      {otpError && <p className="text-xs text-destructive">{otpError}</p>}
+      <p className="text-sm text-muted-foreground">
+        Didn't receive code?{" "}
+        <button
+          type="button"
+          disabled={isResending}
+          onClick={handleResend}
+          className="text-primary font-semibold disabled:opacity-50"
+        >
+          {isResending ? "Sending..." : "Resend"}
+        </button>{" "}
+        ·{" "}
+        <button type="button" onClick={onBack} className="text-primary font-semibold">
+          Change details
+        </button>
+      </p>
+      <div className="pt-3">
+        <Button
+          type="submit"
+          className="w-full sm:w-auto min-w-[240px] h-12 bg-gradient-blue hover:opacity-90 text-white rounded-full flex items-center justify-between pl-6 pr-1.5 shadow-md border-0"
+          disabled={isVerifying}
+        >
+          {isVerifying ? (
+            <span className="flex items-center justify-center w-full">
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Verifying...
+            </span>
+          ) : (
+            <>
+              <span className="font-medium text-[15px]">Verify &amp; Continue</span>
+              <span className="grid h-9 w-9 place-items-center rounded-full bg-white text-[#8B5CF6] ml-4">
+                <ArrowRight className="h-4 w-4" strokeWidth={2.5} />
+              </span>
+            </>
+          )}
+        </Button>
+      </div>
+    </form>
+  );
+}
+
+function SetupStep({
+  organizerId,
+  initialActivitySlug,
+  session,
+  setSession,
+  onNext,
+}: {
+  organizerId: number | null;
+  initialActivitySlug?: string;
+  session: SessionSetup;
+  setSession: Dispatch<SetStateAction<SessionSetup>>;
+  onNext: (bookingId: number) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [errors, setErrors] = useState<SetupFieldErrors>({});
+  const [isSaving, setIsSaving] = useState(false);
+
+  const { data: games, isLoading: gamesLoading } = useGames();
+  const { data: packages, isLoading: packagesLoading } = usePackages();
+  const { data: gameDetails, isLoading: gameDetailsLoading } = useGameDetails(session.activityId);
+  const [dateOpen, setDateOpen] = useState(false);
+
+  const { minDate: todayStr, maxDate: maxDateStr } = getSelectableScheduleDateBounds();
+  const selectedScheduleDate = session.scheduledDate ? new Date(`${session.scheduledDate}T00:00:00`) : undefined;
+  const disabledScheduleDays = {
+    before: new Date(`${todayStr}T00:00:00`),
+    after: new Date(`${maxDateStr}T00:00:00`),
+  };
+
+  const isAllowedScheduleDate = (value: string) => {
+    if (!value) return false;
+    return value >= todayStr && value <= maxDateStr;
+  };
+
+  const selectActivity = (activity: ApiActivity) => {
+    setSession((prev) => ({
+      ...prev,
+      activityId: activity.id,
+      activityTitle: activity.title,
+      gameId: null,
+      gameTitle: "",
+    }));
+    setErrors((prev) => ({ ...prev, activity: undefined, game: undefined }));
+  };
+
+  useEffect(() => {
+    if (!games?.length || session.activityId) return;
+    const match = initialActivitySlug
+      ? games.find((g) => g.slug === initialActivitySlug)
+      : games[0];
+    if (match) selectActivity(match);
+  }, [games, initialActivitySlug, session.activityId]);
+
+  useEffect(() => {
+    if (!gameDetails?.sub_games?.length) return;
+    const first = gameDetails.sub_games[0];
+    setSession((prev) => ({
+      ...prev,
+      gameId: first.id,
+      gameTitle: first.title,
+    }));
+  }, [gameDetails, setSession]);
+
+  const handleSubmit = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+
+    const clientErrors = validateSessionSetup({
+      activityId: session.activityId,
+      gameId: session.gameId,
+      package: session.package,
+      scheduledDate: session.scheduledDate,
+      scheduledTime: session.scheduledTime,
+    });
+
+    if (Object.keys(clientErrors).length > 0) {
+      setErrors(clientErrors);
+      // Surface the specific missing field so the user knows exactly what to fix
+      // (the package is the one most people skip).
+      toastError(
+        clientErrors.package ??
+          clientErrors.activity ??
+          clientErrors.scheduledDate ??
+          clientErrors.scheduledTime ??
+          clientErrors.game ??
+          "Please complete all required fields."
+      );
+      return;
+    }
+
+    if (!organizerId || !session.activityId || !session.gameId || !session.package) {
+      toastError("Missing booking details. Please go back and verify your email.");
+      return;
+    }
+
+    setIsSaving(true);
+    try {
+      const data = await organizerService.createBooking({
+        organizer_id: organizerId,
+        activity_id: session.activityId,
+        game_id: session.gameId,
+        package_id: session.package.id,
+        scheduled_date: session.scheduledDate,
+        scheduled_time: normalizeScheduledTime(session.scheduledTime),
+      });
+      toastSuccess("Session setup saved.");
+      onNext(data.booking_id);
+    } catch (err) {
+      const { message, fieldErrors } = parseApiError(err);
+      setErrors(mapApiFieldErrors(fieldErrors) as SetupFieldErrors);
+      toastError(message);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const activityImage = (activity: ApiActivity) => {
+    if (activity.icon) return resolveMediaUrl(activity.icon) ?? undefined;
+    // fallback mapping if icon missing
+    if (activity.slug === "mystery-quest" || activity.title === "Detective Mystery") return mystery;
+    return cook;
+  };
+
+  return (
+    <form onSubmit={handleSubmit} className="space-y-5">
+      <div>
+        <h2 className="text-2xl font-bold">Choose Your Activity, Package &amp; Schedule</h2>
+        <p className="text-sm text-muted-foreground mt-1">
+          Select your activity, team size, and schedule your experience.
+        </p>
+      </div>
+
+      <div>
+        <label className="text-sm font-semibold">Choose your Activity</label>
+        {gamesLoading ? (
+          <div className="mt-2 flex items-center gap-2 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" /> Loading activities...
+          </div>
+        ) : games?.length ? (
+          <div className="mt-2 grid grid-cols-2 gap-3">
+            {games.map((activity) => (
+              <button
+                key={activity.id}
+                type="button"
+                onClick={() => selectActivity(activity)}
+                className={`flex items-center justify-between gap-3 rounded-2xl border-2 p-2.5 pl-4 transition-all duration-300 ${
+                  session.activityId === activity.id
+                    ? "border-[#8B5CF6] bg-purple-50"
+                    : "border-gray-200 hover:border-gray-300"
+                }`}
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <span
+                    className={`h-[18px] w-[18px] shrink-0 rounded-full border-[1.5px] ${
+                      session.activityId === activity.id ? "border-[#8B5CF6] bg-white" : "border-gray-400 bg-white"
+                    } grid place-items-center`}
+                  >
+                    {session.activityId === activity.id && (
+                      <span className="h-2.5 w-2.5 rounded-full bg-[#8B5CF6]" />
+                    )}
+                  </span>
+                  <span className="text-sm font-bold text-foreground truncate">
+                    {activity.slug === "mystery-quest" || activity.title === "Detective Mystery" ? "Mystery Quest" : activity.title}
+                  </span>
+                </div>
+                <img
+                  src={activityImage(activity)}
+                  alt={activity.title}
+                  className="h-10 w-10 md:h-12 md:w-12 object-contain drop-shadow-md shrink-0"
+                />
+              </button>
+            ))}
+          </div>
+        ) : (
+          <p className="mt-2 text-sm text-destructive">No activities available right now.</p>
+        )}
+        {errors.activity && <p className="mt-1 text-xs text-destructive">{errors.activity}</p>}
+        {gameDetailsLoading && session.activityId && (
+          <p className="mt-2 text-xs text-muted-foreground">Loading game variant...</p>
+        )}
+        {errors.game && <p className="mt-1 text-xs text-destructive">{errors.game}</p>}
+      </div>
+
+      <div>
+        <div className="flex items-center justify-between">
+          <label className="text-sm font-semibold">Choose your Package</label>
+          {session.package && (
+            <button
+              type="button"
+              onClick={() => setOpen(true)}
+              className="rounded-full bg-purple-100 text-primary px-4 py-1 text-xs font-medium"
+            >
+              Change Package
+            </button>
+          )}
+        </div>
+        {session.package ? (
+          <div className="mt-2 rounded-xl border-2 border-primary p-4 grid grid-cols-2 gap-4">
+            <div>
+              <p className="font-bold">{session.package.name}</p>
+              {session.package.short_description && (
+                <p className="text-xs text-muted-foreground mt-1">{session.package.short_description}</p>
+              )}
+              <p className="mt-2 text-lg font-bold">
+                {formatPrice(session.package.price)}{" "}
+                <span className="text-xs font-normal text-muted-foreground">One Time Payment</span>
+              </p>
+              {perUserLabel(session.package.price, session.package.max_users) && (
+                <p className="text-xs text-muted-foreground">
+                  {perUserLabel(session.package.price, session.package.max_users)}
+                </p>
+              )}
+            </div>
+            <div>
+              <p className="text-xs font-semibold mb-1">This plan includes:</p>
+              <ul className="space-y-1">
+                {(session.package.features ?? []).map((f) => (
+                  <li key={f} className="flex items-start gap-1.5 text-xs">
+                    <Check className="h-3.5 w-3.5 text-success mt-0.5 shrink-0" />
+                    {f}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setOpen(true)}
+            disabled={packagesLoading}
+            className="mt-2 w-full rounded-xl border border-input p-2 flex justify-center disabled:opacity-50"
+          >
+            <span className="rounded-full bg-purple-100 text-primary px-5 py-1.5 text-sm font-medium">
+              {packagesLoading ? "Loading packages..." : "Choose Package"}
+            </span>
+          </button>
+        )}
+        {errors.package && <p className="mt-1 text-xs text-destructive">{errors.package}</p>}
+      </div>
+
+      <div className="rounded-xl bg-white-50 p-4 text-xs text-foreground/80 space-y-1.5">
+        <p className="font-semibold text-foreground">Schedule Your Session</p>
+        <p>• Session access is valid for 5 days from the moment of payment activation, not from your scheduled date.</p>
+        <p>• Share the session link with participants 10 minutes before your scheduled time, they can join as soon as the session is live.</p>
+        <p>• You can update your session date and time once from your HR Dashboard. The 5-day access window will not reset on rescheduling.</p>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <label className="text-sm font-medium" htmlFor="session-date">
+            Schedule Date
+          </label>
+          <Popover open={dateOpen} onOpenChange={setDateOpen}>
+            <PopoverTrigger asChild>
+              <Button
+                id="session-date"
+                type="button"
+                variant="outline"
+                className={`mt-1.5 w-full justify-between px-4 py-2.5 text-sm font-normal ${
+                  errors.scheduledDate ? "border-destructive" : "border-input"
+                }`}
+              >
+                <span>{session.scheduledDate ? formatDisplayDate(session.scheduledDate) : "Select schedule date"}</span>
+                <CalendarIcon className="h-4 w-4 text-muted-foreground" />
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent className="w-auto p-0" align="start">
+              <CalendarPicker
+                mode="single"
+                selected={selectedScheduleDate}
+                disabled={disabledScheduleDays}
+                defaultMonth={selectedScheduleDate ?? new Date(`${todayStr}T00:00:00`)}
+                onSelect={(date) => {
+                  if (!date) {
+                    setSession((prev) => ({ ...prev, scheduledDate: "" }));
+                    setErrors((prev) => ({ ...prev, scheduledDate: undefined }));
+                    return;
+                  }
+
+                  const nextValue = formatDateInputValue(date);
+                  if (isAllowedScheduleDate(nextValue)) {
+                    setSession((prev) => ({ ...prev, scheduledDate: nextValue }));
+                    setErrors((prev) => ({ ...prev, scheduledDate: undefined }));
+                    setDateOpen(false);
+                    return;
+                  }
+
+                  setErrors((prev) => ({
+                    ...prev,
+                    scheduledDate: "Please select a date from today through the next 5 days",
+                  }));
+                }}
+              />
+            </PopoverContent>
+          </Popover>
+          {errors.scheduledDate && (
+            <p className="mt-1 text-xs text-destructive">{errors.scheduledDate}</p>
+          )}
+        </div>
+        <div>
+          <label className="text-sm font-medium" htmlFor="session-time">
+            Start Time
+          </label>
+          <input
+            id="session-time"
+            type="time"
+            value={session.scheduledTime}
+            onChange={(e) => {
+              setSession((prev) => ({ ...prev, scheduledTime: e.target.value }));
+              setErrors((prev) => ({ ...prev, scheduledTime: undefined }));
+            }}
+            className={`mt-1.5 w-full rounded-lg border px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary/30 ${
+              errors.scheduledTime ? "border-destructive" : "border-input"
+            }`}
+          />
+          {errors.scheduledTime && (
+            <p className="mt-1 text-xs text-destructive">{errors.scheduledTime}</p>
+          )}
+        </div>
+      </div>
+
+      <p className="rounded-2xl border border-sky-500 bg-sky-100 px-5 py-4 text-sm leading-relaxed text-foreground">
+        After activation, you will receive a unique session access link. Share it with your participants, they simply enter their email ID, verify via OTP, and join the activity instantly. No app download, no passwords, no pre-registration needed.
+      </p>
+
+      <PillButton
+        type="submit"
+        variant="primary"
+        disabled={isSaving}
+      >
+        {isSaving ? "Saving..." : "Continue to Payment"}
+      </PillButton>
+
+      {open && (
+        <PackageModal
+          packages={packages ?? []}
+          current={session.package}
+          onClose={() => setOpen(false)}
+          onConfirm={(p) => {
+            setSession((prev) => ({ ...prev, package: p }));
+            setErrors((prev) => ({ ...prev, package: undefined }));
+            setOpen(false);
+          }}
+        />
+      )}
+    </form>
+  );
+}
+
+function PackageModal({
+  packages,
+  current,
+  onClose,
+  onConfirm,
+}: {
+  packages: ApiPackage[];
+  current: ApiPackage | null;
+  onClose: () => void;
+  onConfirm: (p: ApiPackage) => void;
+}) {
+  const [sel, setSel] = useState<ApiPackage | null>(current ?? packages[0] ?? null);
+
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4" onClick={onClose}>
+      <div
+        className="bg-card rounded-3xl shadow-elevated w-full max-w-5xl max-h-[90vh] overflow-y-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between p-6 border-b border-border">
+          <h3 className="text-xl font-bold">Choose your Package</h3>
+          <button type="button" onClick={onClose} className="h-9 w-9 grid place-items-center rounded-full hover:bg-muted">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+        <div className="p-6 grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {packages.map((p) => {
+            const active = sel?.id === p.id;
+            const features = Array.isArray(p.features) ? p.features : [];
+            return (
+              <button
+                key={p.id}
+                type="button"
+                onClick={() => setSel(p)}
+                className={`text-left rounded-2xl border-2 p-5 transition ${
+                  active ? "border-primary shadow-glow" : "border-border"
+                }`}
+              >
+                <div className="flex items-start justify-between">
+                  <p className="font-bold">{p.name}</p>
+                  <span
+                    className={`h-5 w-5 rounded-full border-2 grid place-items-center ${
+                      active ? "border-primary" : "border-muted-foreground"
+                    }`}
+                  >
+                    {active && <span className="h-2.5 w-2.5 rounded-full bg-primary" />}
+                  </span>
+                </div>
+                {p.short_description && (
+                  <p className="text-xs text-muted-foreground mt-2 min-h-[32px]">{p.short_description}</p>
+                )}
+                <p className="mt-3 text-xl font-bold">
+                  {formatPrice(p.price)}{" "}
+                  {perUserLabel(p.price, p.max_users) && (
+                    <span className="text-xs font-normal text-muted-foreground">
+                      {perUserLabel(p.price, p.max_users)}
+                    </span>
+                  )}
+                  <span className="text-xs font-normal text-muted-foreground"> One Time Payment</span>
+                </p>
+                <p className="text-xs font-semibold mt-4">This plan includes:</p>
+                <ul className="mt-2 space-y-1.5">
+                  {features.map((f) => (
+                    <li key={f} className="flex items-start gap-2 text-xs">
+                      <Check className="h-3.5 w-3.5 text-success mt-0.5 shrink-0" />
+                      {f}
+                    </li>
+                  ))}
+                </ul>
+              </button>
+            );
+          })}
+        </div>
+        <div className="flex justify-between gap-3 p-6 border-t border-border">
+          <button type="button" onClick={onClose} className="rounded-full border border-border px-6 py-2.5 text-sm">
+            Cancel
+          </button>
+          <button
+            type="button"
+            disabled={!sel}
+            onClick={() => sel && onConfirm(sel)}
+            className="rounded-full bg-gradient-primary text-white px-8 py-2.5 text-sm font-medium shadow-glow disabled:opacity-50"
+          >
+            Confirm
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Payment method chooser.
+ *
+ * The options are whatever the server says they are — which gateways are
+ * switched on, whether Razorpay actually has credentials, and whether this
+ * order total falls inside the COD limits. A disabled option still renders,
+ * with its reason, rather than vanishing: silently missing choices read as a
+ * broken page.
+ */
+function PaymentMethodSelector({
+  methods,
+  selected,
+  onSelect,
+  isLoading,
+  error,
+}: {
+  methods: PaymentMethodOption[];
+  selected: PaymentMethodId | null;
+  onSelect: (id: PaymentMethodId) => void;
+  isLoading: boolean;
+  error?: string;
+}) {
+  if (isLoading) {
+    return (
+      <div>
+        <p className="text-sm font-semibold mb-2">Payment Method</p>
+        <div className="flex items-center gap-2 rounded-xl border border-border p-4 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          Loading payment options...
+        </div>
+      </div>
+    );
+  }
+
+  if (methods.length === 0) {
+    return (
+      <div>
+        <p className="text-sm font-semibold mb-2">Payment Method</p>
+        <div className="rounded-xl border border-destructive/40 bg-destructive/5 p-4 text-sm text-destructive">
+          No payment method is currently available. Please contact support.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <p className="text-sm font-semibold mb-2">Payment Method</p>
+
+      {/* Single column on mobile so the description text never gets squeezed. */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        {methods.map((method) => {
+          const isSelected = selected === method.id;
+
+          return (
+            <label
+              key={method.id}
+              className={`flex items-start gap-3 rounded-xl border p-4 text-sm transition-colors ${
+                method.enabled
+                  ? `cursor-pointer ${isSelected ? "border-primary bg-primary/5" : "border-input hover:border-primary/40"}`
+                  : "border-input bg-muted/40 opacity-60 cursor-not-allowed"
+              }`}
+            >
+              <input
+                type="radio"
+                name="payment_method"
+                value={method.id}
+                checked={isSelected}
+                disabled={!method.enabled}
+                onChange={() => onSelect(method.id)}
+                className="mt-0.5 accent-primary"
+              />
+              <span className="flex-1">
+                <span className="flex items-center gap-2 font-medium">
+                  {method.id === "razorpay" ? (
+                    <LockKeyhole className="h-3.5 w-3.5 text-primary" />
+                  ) : (
+                    <PackageIcon className="h-3.5 w-3.5 text-primary" />
+                  )}
+                  {method.label}
+                  {method.mode === "test" && (
+                    <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-amber-700">
+                      Test Mode
+                    </span>
+                  )}
+                </span>
+
+                <span className="mt-1 block text-xs text-muted-foreground">
+                  {method.description}
+                </span>
+
+                {method.id === "razorpay" && method.enabled && method.supported_methods?.length ? (
+                  <span className="mt-2 flex flex-wrap gap-1">
+                    {method.supported_methods.map((label) => (
+                      <span
+                        key={label}
+                        className="rounded border border-border bg-muted/60 px-1.5 py-0.5 text-[10px] text-muted-foreground"
+                      >
+                        {label}
+                      </span>
+                    ))}
+                  </span>
+                ) : null}
+
+                {!method.enabled && method.unavailable_reason && (
+                  <span className="mt-2 block text-[11px] font-medium text-destructive">
+                    {method.unavailable_reason}
+                  </span>
+                )}
+              </span>
+            </label>
+          );
+        })}
+      </div>
+
+      {error && <p className="mt-1 text-xs text-destructive">{error}</p>}
+    </div>
+  );
+}
+
+const CONSENT_ITEMS: { key: keyof BookingConsents; text: string }[] = [
+  {
+    key: "authorization",
+    text: "I confirm I am an authorized representative of my organization and have approval to create this session on its behalf.",
+  },
+  {
+    key: "participant_consent",
+    text: "I confirm that all participants have been informed about this session and have consented to participate.",
+  },
+  { key: "terms_accepted", text: "I have read and agree to the Terms & Conditions and Privacy Policy." },
+  {
+    key: "non_refundable_accepted",
+    text: "I understand this is a non-refundable digital service after activation, except in cases of verified technical failure on Zoventro's platform as outlined in the Refund Policy.",
+  },
+  {
+    key: "validity_accepted",
+    text: "I understand the session must be used within 5 days of activation, after which all access will expire automatically.",
+  },
+  {
+    key: "participant_max",
+    text: "I understand that participants must join in multiples of 5. If my organization has participants who are not divisible by 5, the remaining users will not be assigned to a group and will be unable to participate in the activity. Zoventro is not responsible for unassigned participants due to incomplete group formation.",
+  },
+];
+
+function PaymentStep({
+  bookingId,
+  session,
+  registration,
+  onComplete,
+}: {
+  bookingId: number | null;
+  session: SessionSetup;
+  registration: RegistrationFormData;
+  onComplete: (invitationLink: string) => void;
+}) {
+  const [isPaying, setIsPaying] = useState(false);
+  const [errors, setErrors] = useState<BillingFieldErrors>({});
+  const [gstNumber, setGstNumber] = useState("");
+  const [billingAddress, setBillingAddress] = useState("");
+  const [city, setCity] = useState("");
+  const [state, setState] = useState("");
+  const [pinCode, setPinCode] = useState("");
+  const [paymentMethod, setPaymentMethod] = useState<PaymentMethodId | null>(null);
+  const [consents, setConsents] = useState<BookingConsents>({
+    authorization: false,
+    participant_consent: false,
+    terms_accepted: false,
+    non_refundable_accepted: false,
+    validity_accepted: false,
+  });
+
+  const price = session.package?.price ?? 0;
+  const { priceNum, gst, total } = calculateBillingTotals(price);
+  const fmt = formatPrice;
+
+  // Fetched with the total so the server can apply COD min/max to this order.
+  const { data: paymentMethodData, isLoading: isLoadingMethods } = usePaymentMethods(total);
+  const paymentMethods = paymentMethodData?.methods ?? [];
+  const selectedMethod = paymentMethods.find((m) => m.id === paymentMethod) ?? null;
+
+  // Preselect the first usable option once the list arrives, and drop a
+  // selection that has become unavailable (an admin toggling a gateway off, or
+  // the total moving outside the COD range after a package change).
+  useEffect(() => {
+    if (paymentMethods.length === 0) return;
+
+    const stillValid = paymentMethods.some((m) => m.id === paymentMethod && m.enabled);
+    if (stillValid) return;
+
+    setPaymentMethod(paymentMethods.find((m) => m.enabled)?.id ?? null);
+  }, [paymentMethods, paymentMethod]);
+
+  const toggleConsent = (key: keyof BookingConsents) => {
+    setConsents((prev) => ({ ...prev, [key]: !prev[key] }));
+    if (errors.consents) setErrors((prev) => ({ ...prev, consents: undefined }));
+  };
+
+  const handleSubmit = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+
+    if (!bookingId) {
+      toastError("Booking not found. Please go back and complete setup.");
+      return;
+    }
+
+    const clientErrors = validateBillingForm({
+      billing_address: billingAddress,
+      city,
+      state,
+      pin_code: pinCode,
+      payment_method: paymentMethod ?? "",
+      gst_number: gstNumber,
+      consents,
+    });
+
+    if (Object.keys(clientErrors).length > 0) {
+      setErrors(clientErrors);
+      toastWarning(clientErrors.consents ?? "Please fix the errors below.");
+      return;
+    }
+
+    if (!paymentMethod || !selectedMethod?.enabled) {
+      setErrors((prev) => ({ ...prev, payment_method: "Please select an available payment method" }));
+      return;
+    }
+
+    setIsPaying(true);
+    try {
+      // One call for both methods: it stores the billing snapshot and either
+      // completes a COD order or opens a Razorpay order for payment.
+      const data = await organizerService.completeBooking({
+        booking_id: bookingId,
+        gst_number: gstNumber.trim(),
+        billing_address: billingAddress.trim(),
+        city: city.trim(),
+        state: state.trim(),
+        pin_code: pinCode.trim(),
+        payment_method: paymentMethod,
+        consents,
+      });
+
+      // COD: nothing to pay now, the order is already placed.
+      if (!data.requires_payment) {
+        toastSuccess("Order placed successfully. Pay on delivery as per COD terms.");
+        onComplete(data.invitation_link ?? "");
+        return;
+      }
+
+      if (!data.razorpay?.order_id) {
+        throw new Error("Payment could not be initiated. Please try again.");
+      }
+
+      await startRazorpayCheckout(data.razorpay);
+    } catch (err) {
+      const { message, fieldErrors } = parseApiError(err);
+      setErrors(mapApiFieldErrors(fieldErrors) as BillingFieldErrors);
+      toastError(message);
+      setIsPaying(false);
+    }
+    // Deliberately no `finally`: the Razorpay branch keeps the button busy
+    // while its modal is open and clears the flag from its own callbacks.
+  };
+
+  /**
+   * Opens Razorpay Checkout and hands the result back for server-side
+   * verification.
+   *
+   * The booking is not activated by anything that happens here — success is
+   * whatever `verifyPayment` returns after the server re-derives the signature
+   * and re-fetches the payment from Razorpay.
+   */
+  const startRazorpayCheckout = async (razorpay: {
+    key_id: string;
+    order_id: string;
+    amount: number;
+    currency: string;
+  }) => {
+    try {
+      await loadRazorpayCheckout();
+    } catch {
+      toastError("Could not load the payment gateway. Please check your connection and try again.");
+      setIsPaying(false);
+      return;
+    }
+
+    openRazorpayCheckout({
+      key: razorpay.key_id,
+      amount: razorpay.amount,
+      currency: razorpay.currency,
+      name: "Zoventro",
+      description: session.package?.name
+        ? `${session.activityTitle} — ${session.package.name}`
+        : "Session activation",
+      order_id: razorpay.order_id,
+      prefill: {
+        name: registration.name,
+        email: registration.email,
+      },
+      notes: { booking_id: String(bookingId ?? "") },
+      theme: { color: "#7c3aed" },
+      handler: async (response) => {
+        try {
+          const verified = await organizerService.verifyPayment({
+            razorpay_order_id: response.razorpay_order_id,
+            razorpay_payment_id: response.razorpay_payment_id,
+            razorpay_signature: response.razorpay_signature,
+          });
+
+          toastSuccess("Payment successful. Your session is now active.");
+          onComplete(verified.invitation_link);
+        } catch (err) {
+          // Money may well have been taken — the webhook is the backstop, so
+          // never tell the customer the payment failed outright.
+          const { message } = parseApiError(err);
+          toastError(
+            message ||
+              "We could not confirm your payment yet. If it was debited it will be confirmed shortly."
+          );
+        } finally {
+          setIsPaying(false);
+        }
+      },
+      modal: {
+        ondismiss: () => {
+          setIsPaying(false);
+          toastWarning("Payment cancelled. You can try again when you're ready.");
+          // Best-effort: stops the attempt sitting as `pending` forever. The
+          // server ignores this for an already-captured payment.
+          organizerService
+            .reportPaymentFailure({
+              razorpay_order_id: razorpay.order_id,
+              cancelled: true,
+              reason: "Checkout dismissed by user",
+            })
+            .catch(() => {
+              /* advisory only — never block the UI on it */
+            });
+        },
+      },
+    });
+  };
+
+  return (
+    <form onSubmit={handleSubmit} className="space-y-5">
+      <div>
+        <h2 className="text-2xl font-bold">Review &amp; Activate Your Team Activity</h2>
+        <p className="text-sm text-muted-foreground mt-1">
+          Complete payment to generate your access link and start your activity.
+        </p>
+      </div>
+
+      <div>
+        <p className="text-sm font-semibold mb-2">Organizer Details</p>
+        <div className="rounded-xl border border-border p-4 grid grid-cols-2 gap-3 text-sm">
+          <div>
+            <p className="text-xs text-muted-foreground">Full Name</p>
+            <p className="font-medium">{registration.name || "—"}</p>
+          </div>
+          <div>
+            <p className="text-xs text-muted-foreground">Official Email ID</p>
+            <p className="font-medium">{registration.email || "—"}</p>
+          </div>
+          <div>
+            <p className="text-xs text-muted-foreground">Company / Organization Name</p>
+            <p className="font-medium">{registration.company_name || "—"}</p>
+          </div>
+          <div>
+            <p className="text-xs text-muted-foreground">Company Website  (http://exmpale.com/)</p>
+            <p className="font-medium">{registration.company_website || "—"}</p>
+          </div>
+        </div>
+      </div>
+
+      <Section title="Activity & Package">
+        <Row k="Selected Activity" v={session.activityTitle || "—"} />
+        <Row
+          k="Selected Package"
+          v={session.package ? `${session.package.name} @ ${formatPrice(session.package.price)}` : "—"}
+        />
+      </Section>
+
+      <Section title="Schedule">
+        <Row
+          k="Date"
+          v={session.scheduledDate ? formatDisplayDate(session.scheduledDate) : "—"}
+        />
+        <Row
+          k="Start Time"
+          v={session.scheduledTime ? formatDisplayTime(normalizeScheduledTime(session.scheduledTime)) : "—"}
+        />
+      </Section>
+
+      <div>
+        <p className="text-sm font-semibold">Billing Details (GST Invoice) (Ex.29ABCDE1234F1Z5)</p>
+        <p className="text-xs text-muted-foreground mt-0.5">
+          A GST invoice will be automatically generated and sent to your registered email after successful payment
+        </p>
+        <div className="mt-3 space-y-3">
+          <BField
+            label="GST Number *"
+            placeholder="Enter GST Number (Ex.29ABCDE1234F1Z5)"
+            value={gstNumber}
+            onChange={(value) => setGstNumber(value.toUpperCase().replace(/[^0-9A-Z]/g, '').slice(0, 15))}
+            error={errors.gst_number}
+          />
+          <BField
+            label="Billing Address"
+            placeholder="Enter Billing Address"
+            value={billingAddress}
+            onChange={setBillingAddress}
+            error={errors.billing_address}
+          />
+          <div className="grid grid-cols-2 gap-3">
+            <BField label="City" placeholder="Enter City" value={city} onChange={setCity} error={errors.city} />
+            <BField
+              label="State"
+              placeholder="Select State"
+              value={state}
+              onChange={setState}
+              error={errors.state}
+              options={INDIAN_STATES}
+            />
+          </div>
+          <BField
+            label="PIN Code"
+            placeholder="Enter PIN Code"
+            value={pinCode}
+            onChange={(value) => setPinCode(value.replace(/\D/g, '').slice(0, 6))}
+            error={errors.pin_code}
+          />
+        </div>
+      </div>
+
+      <div className="rounded-xl border border-border p-4 space-y-2">
+        <Row k="Package Price" v={fmt(priceNum)} />
+        <Row k="GST (18%)" v={fmt(gst)} />
+        <Row k="Additional Charges" v="₹0" />
+        <div className="border-t border-border pt-2.5 mt-2.5">
+          <Row k="Total Payable" v={fmt(total)} bold />
+        </div>
+      </div>
+
+      <PaymentMethodSelector
+        methods={paymentMethods}
+        selected={paymentMethod}
+        isLoading={isLoadingMethods}
+        error={errors.payment_method}
+        onSelect={(id) => {
+          setPaymentMethod(id);
+          setErrors((prev) => ({ ...prev, payment_method: undefined }));
+        }}
+      />
+
+      <div className="rounded-xl border border-sky-500 bg-sky-100 p-4 sm:p-5 space-y-4 text-sm text-foreground">
+        {CONSENT_ITEMS.map(({ key, text }) => (
+          <label key={key} className="flex items-start gap-3 leading-relaxed">
+            <input
+              type="checkbox"
+              checked={consents[key]}
+              onChange={() => toggleConsent(key)}
+              className="mt-0.5 h-6 w-6 shrink-0 rounded-md accent-primary"
+            />
+            <span className="pt-0.5 text-xs">{text}</span>
+
+          </label>
+        ))}
+        {errors.consents && <p className="text-destructive">{errors.consents}</p>}
+      </div>
+
+      <p className="text-sm leading-relaxed text-muted-foreground">
+        By completing payment, you agree to all terms above. This is a B2B transaction between Zoventro and your organization.
+      </p>
+
+      {/* Label follows the method: Razorpay hands off to a gateway, COD does not. */}
+      <PillButton
+        type="submit"
+        variant="primary"
+        disabled={isPaying || !bookingId || !selectedMethod?.enabled}
+      >
+        {isPaying
+          ? paymentMethod === "cod"
+            ? "Placing Order..."
+            : "Processing..."
+          : (selectedMethod?.cta ?? "Continue to Payment")}
+      </PillButton>
+
+      {paymentMethod === "cod" && (
+        <p className="text-center text-xs text-muted-foreground">
+          Your session link is issued immediately. Payment is collected as per Cash on Delivery terms.
+        </p>
+      )}
+    </form>
+  );
+}
+
+function BField({
+  label,
+  placeholder,
+  value,
+  onChange,
+  error,
+  options,
+}: {
+  label: string;
+  placeholder: string;
+  value: string;
+  onChange: (value: string) => void;
+  error?: string;
+  options?: { value: string; label: string }[];
+}) {
+  return (
+    <div>
+      <label className="text-xs font-medium">{label}</label>
+      {options ? (
+        <select
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className={`mt-1 w-full rounded-lg border px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary/30 ${
+            error ? "border-destructive" : "border-input"
+          }`}
+        >
+          <option value="" disabled>
+            {placeholder}
+          </option>
+          {options.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+      ) : (
+        <input
+          type="text"
+          placeholder={placeholder}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className={`mt-1 w-full rounded-lg border px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary/30 ${
+            error ? "border-destructive" : "border-input"
+          }`}
+        />
+      )}
+      {error && <p className="mt-1 text-xs text-destructive">{error}</p>}
+    </div>
+  );
+}
+
+function Section({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div>
+      <p className="text-sm font-semibold mb-2">{title}</p>
+      <div className="rounded-xl border border-border p-4 space-y-2">{children}</div>
+    </div>
+  );
+}
+function Row({ k, v, bold }: { k: string; v: string; bold?: boolean }) {
+  return (
+    <div className="flex justify-between text-sm">
+      <span className="text-muted-foreground">{k}</span>
+      <span className={bold ? "font-bold text-base" : "font-medium"}>{v}</span>
+    </div>
+  );
+}
+
+function formatSessionDate(value: string): { date: string; weekday: string } | null {
+  if (!value) return null;
+  const d = new Date(`${value}T00:00:00`);
+  if (Number.isNaN(d.getTime())) return null;
+  return {
+    date: d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" }),
+    weekday: d.toLocaleDateString("en-US", { weekday: "long" }),
+  };
+}
+
+function formatSessionTime(value: string): string | null {
+  if (!value) return null;
+  const [h, m] = value.split(":").map(Number);
+  if (!Number.isFinite(h)) return null;
+  const d = new Date();
+  d.setHours(h, Number.isFinite(m) ? m : 0, 0, 0);
+  return d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true });
+}
+
+function SuccessCard({
+  invitationLink,
+  session,
+  bookingId,
+  onReset,
+}: {
+  invitationLink: string | null;
+  session: SessionSetup;
+  bookingId: number | null;
+  onReset: () => void;
+}) {
+  const joinUrl = invitationLink ? buildJoinUrl(invitationLink) : null;
+  const authed = isOrganizerAuthenticated();
+  const pkg = session.package;
+  const schedule = formatSessionDate(session.scheduledDate);
+  const startTime = formatSessionTime(session.scheduledTime);
+  const packageRef = bookingId ? `ZV-${String(bookingId).padStart(4, "0")}` : null;
+  const groupSize =
+    pkg?.max_users && pkg?.total_groups ? Math.max(1, Math.round(pkg.max_users / pkg.total_groups)) : 5;
+
+  const copyLink = async () => {
+    if (!joinUrl) return;
+    try {
+      await navigator.clipboard.writeText(joinUrl);
+      toastSuccess("Link copied to clipboard.");
+    } catch {
+      toastError("Could not copy link.");
+    }
+  };
+
+  const shareByEmail = () => {
+    if (!joinUrl) return;
+    const subject = encodeURIComponent(`You're invited: ${session.activityTitle || "Team Activity"}`);
+    const body = encodeURIComponent(
+      `Join our team activity here:\n${joinUrl}\n\nUse your work email to verify and get assigned to your group.`
+    );
+    window.location.href = `mailto:?subject=${subject}&body=${body}`;
+  };
+
+  const shareMore = async () => {
+    if (!joinUrl) return;
+    if (navigator.share) {
+      try {
+        await navigator.share({ title: session.activityTitle || "Team Activity", url: joinUrl });
+      } catch {
+        /* user dismissed the share sheet */
+      }
+    } else {
+      copyLink();
+    }
+  };
+
+  return (
+    <div className="mx-auto max-w-4xl mt-12">
+      {/* Header */}
+      <div className="text-center">
+        <div className="mx-auto h-16 w-16 rounded-full bg-success/15 grid place-items-center">
+          <CheckCircle2 className="h-9 w-9 text-success" />
+        </div>
+        <h2 className="mt-5 text-3xl font-bold">Your Team Activity is Ready!</h2>
+        <p className="mt-2 text-muted-foreground">
+          Congratulations! Your activity has been successfully activated.
+          <br />
+          Share your access link with participants and let the fun begin!
+        </p>
+      </div>
+
+      {/* Session Access Link */}
+      <div className="mt-8 rounded-3xl bg-card shadow-card p-6 sm:p-8 text-left">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="grid h-11 w-11 place-items-center rounded-xl bg-primary/10">
+              <Link2 className="h-5 w-5 text-primary" />
+            </div>
+            <div>
+              <p className="text-base font-bold">Session Access Link</p>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Share this link with participants 10 minutes before the start time
+              </p>
+            </div>
+          </div>
+          {packageRef && (
+            <div className="text-xs text-muted-foreground flex items-center gap-1.5">
+              Your Unique Package ID:
+              <span className="rounded-full bg-primary/10 text-primary font-semibold px-2.5 py-0.5">
+                {packageRef}
+              </span>
+            </div>
+          )}
+        </div>
+
+        <div className="mt-5 flex items-stretch gap-2">
+          <div className="flex-1 rounded-xl border border-border bg-muted/40 px-4 py-3 text-sm font-mono font-medium text-primary truncate flex items-center">
+            {joinUrl ?? "Link will appear after activation"}
+          </div>
+          <button
+            type="button"
+            onClick={copyLink}
+            disabled={!joinUrl}
+            className="inline-flex items-center gap-2 rounded-xl bg-gradient-primary text-white px-5 py-3 text-sm font-medium shadow-glow hover:opacity-90 disabled:opacity-50"
+          >
+            <Copy className="h-4 w-4" /> Copy
+          </button>
+        </div>
+
+        <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
+          <span className="text-sm font-semibold">Share Link</span>
+          <button
+            type="button"
+            onClick={shareByEmail}
+            disabled={!joinUrl}
+            className="inline-flex items-center gap-2 rounded-full border border-border px-8 py-2.5 text-sm font-medium hover:bg-accent disabled:opacity-50"
+          >
+            <Mail className="h-4 w-4" /> Email
+          </button>
+          <button
+            type="button"
+            onClick={shareMore}
+            disabled={!joinUrl}
+            className="inline-flex items-center gap-2 rounded-full border border-border px-8 py-2.5 text-sm font-medium hover:bg-accent disabled:opacity-50"
+          >
+            <Share2 className="h-4 w-4" /> More
+          </button>
+        </div>
+      </div>
+
+      {/* Session Summary */}
+      <div className="mt-6 rounded-3xl bg-card shadow-card p-6 sm:p-8 text-left">
+        <div className="flex items-center gap-3">
+          <div className="grid h-11 w-11 place-items-center rounded-xl bg-primary/10">
+            <CalendarIcon className="h-5 w-5 text-primary" />
+          </div>
+          <p className="text-base font-bold">Session Summary</p>
+        </div>
+
+        <div className="mt-6 grid grid-cols-2 md:grid-cols-5 gap-y-6">
+          <SummaryMeta icon={Gamepad2} label="Activity" v1={session.activityTitle || "—"} v2="" />
+          <SummaryMeta
+            icon={PackageIcon}
+            label="Package"
+            v1={pkg?.name || "—"}
+            v2={pkg?.max_users ? `Up to ${pkg.max_users} Participants` : ""}
+            divider
+          />
+          <SummaryMeta
+            icon={CalendarIcon}
+            label="Date"
+            v1={schedule?.date || "TBA"}
+            v2={schedule ? `(${schedule.weekday})` : ""}
+            divider
+          />
+          <SummaryMeta icon={Clock} label="Start Time" v1={startTime || "TBA"} v2="(IST)" divider />
+          <SummaryMeta
+            icon={LockKeyhole}
+            label="Access Validity"
+            v1="5 Days"
+            v2="from date of payment"
+            divider
+          />
+        </div>
+      </div>
+
+      {/* Note + Actions */}
+      <div className="mt-6 rounded-3xl bg-card shadow-card p-6 sm:p-8 text-left">
+        <div className="grid gap-6 lg:grid-cols-[1fr_auto] items-start">
+          <div className="rounded-2xl border border-sky-200 bg-sky-50 p-5">
+            <p className="text-sm font-semibold text-sky-700">Note</p>
+            <ul className="mt-2 space-y-1.5 pl-4 text-xs text-foreground/80 list-disc marker:text-foreground/40">
+              <li>
+                Access is valid for 5 days from the date and time of payment, expiry is shown above.
+              </li>
+              <li>
+                The session will start at start time, employees need to click the access link and
+                verify email and proceed for activity
+              </li>
+              <li>
+                Share the access link with participants before your scheduled start time, they join
+                using their email ID and OTP.
+              </li>
+              <li>
+                You can reschedule your session date and time once from the dashboard. The 5-day
+                access window will not reset on rescheduling.
+              </li>
+              <li>
+                Your package supports up to {pkg?.max_users ?? 50} participants. For best results,
+                ensure your team size is a multiple of {groupSize}. Participants beyond a complete
+                group of {groupSize} will not be assigned.
+              </li>
+            </ul>
+          </div>
+
+          <div className="flex flex-col gap-3 w-full lg:w-56">
+            {!authed && (
+              <p className="text-xs text-muted-foreground">
+                Log in with your registered email to manage this event from the dashboard.
+              </p>
+            )}
+            <Link
+              to="/"
+              className="inline-flex items-center justify-center rounded-full border border-border bg-white px-6 py-2.5 text-sm font-medium hover:bg-accent"
+            >
+              Go to Home Page
+            </Link>
+            {authed ? (
+              <Link
+                to="/dashboard"
+                className="inline-flex items-center justify-between rounded-full bg-gradient-primary text-white pl-6 pr-1.5 py-1.5 text-sm font-semibold shadow-glow hover:opacity-90"
+              >
+                Go to Dashboard
+                <span className="grid h-8 w-8 place-items-center rounded-full bg-white/20">
+                  <ArrowRight className="h-4 w-4" />
+                </span>
+              </Link>
+            ) : (
+              <Link
+                to="/login"
+                search={{ redirect: "/dashboard" }}
+                className="inline-flex items-center justify-between rounded-full bg-gradient-primary text-white pl-6 pr-1.5 py-1.5 text-sm font-semibold shadow-glow hover:opacity-90"
+              >
+                Login to Dashboard
+                <span className="grid h-8 w-8 place-items-center rounded-full bg-white/20">
+                  <ArrowRight className="h-4 w-4" />
+                </span>
+              </Link>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SummaryMeta({
+  icon: Icon,
+  label,
+  v1,
+  v2,
+  divider,
+}: {
+  icon: ComponentType<{ className?: string }>;
+  label: string;
+  v1: string;
+  v2: string;
+  divider?: boolean;
+}) {
+  return (
+    <div className={`px-4 first:pl-0 ${divider ? "md:border-l md:border-border" : ""}`}>
+      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+        <Icon className="h-4 w-4 text-primary" /> {label}
+      </div>
+      <div className="mt-1.5 text-sm font-bold">{v1}</div>
+      {v2 && <div className="mt-0.5 text-[11px] text-muted-foreground">{v2}</div>}
+    </div>
+  );
+}
